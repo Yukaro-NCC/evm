@@ -28,6 +28,7 @@ const (
 	prefixParams
 	prefixCodeHash
 	prefixEvmCoinInfo
+	prefixDecayTimestamp
 )
 
 // prefix bytes for the EVM transient store
@@ -40,11 +41,12 @@ const (
 
 // KVStore key prefixes
 var (
-	KeyPrefixCode        = []byte{prefixCode}
-	KeyPrefixStorage     = []byte{prefixStorage}
-	KeyPrefixParams      = []byte{prefixParams}
-	KeyPrefixCodeHash    = []byte{prefixCodeHash}
-	KeyPrefixEvmCoinInfo = []byte{prefixEvmCoinInfo}
+	KeyPrefixCode           = []byte{prefixCode}
+	KeyPrefixStorage        = []byte{prefixStorage}
+	KeyPrefixParams         = []byte{prefixParams}
+	KeyPrefixCodeHash       = []byte{prefixCodeHash}
+	KeyPrefixEvmCoinInfo    = []byte{prefixEvmCoinInfo}
+	KeyPrefixDecayTimestamp = []byte{prefixDecayTimestamp}
 )
 
 // Transient Store key prefixes

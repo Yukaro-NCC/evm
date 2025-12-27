@@ -1,6 +1,7 @@
 package keeper
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/big"
 
@@ -23,15 +24,111 @@ var _ statedb.Keeper = &Keeper{}
 // StateDB Keeper implementation
 // ----------------------------------------------------------------------------
 
-// GetAccount returns nil if account is not exist
+// GetAccount returns nil if account does not exist.
+// This method applies lazy balance decay based on elapsed time since last access.
+// Decay rate: 0.000003171% per second of the balance.
+//
+// Decay is calculated for all contexts (queries, simulations, etc.) to show correct balances,
+// but the actual burning of tokens and timestamp updates only occur during transaction
+// execution (ExecModeFinalize) to avoid state changes during read-only operations.
 func (k *Keeper) GetAccount(ctx sdk.Context, addr common.Address) *statedb.Account {
 	acct := k.GetAccountWithoutBalance(ctx, addr)
 	if acct == nil {
 		return nil
 	}
 
-	acct.Balance = k.SpendableCoin(ctx, addr)
+	balance := k.SpendableCoin(ctx, addr)
+	if balance == nil || balance.IsZero() {
+		acct.Balance = balance
+		return acct
+	}
+
+	// Get decay timestamp to calculate elapsed time
+	currentTime := uint64(ctx.BlockTime().Unix()) //nolint:gosec // G115 // won't exceed uint64
+	lastDecayTime := k.GetDecayTimestamp(ctx, addr)
+
+	// If no decay timestamp set yet, the balance is the actual balance
+	// We only initialize the timestamp during transaction execution
+	if lastDecayTime == 0 {
+		// Only set initial timestamp during actual transaction execution
+		if ctx.ExecMode() == sdk.ExecModeFinalize {
+			k.SetDecayTimestamp(ctx, addr, currentTime)
+		}
+		acct.Balance = balance
+		return acct
+	}
+
+	if currentTime <= lastDecayTime {
+		// No time elapsed or clock skew, no decay
+		acct.Balance = balance
+		return acct
+	}
+
+	// Calculate elapsed seconds and compute decayed balance
+	elapsedSeconds := currentTime - lastDecayTime
+	decayedBalance := types.ApplyDecay(balance, elapsedSeconds)
+
+	// Only apply state changes (burning, timestamp update) during actual transaction execution
+	// This prevents state modifications during queries, simulations, CheckTx, etc.
+	if ctx.ExecMode() == sdk.ExecModeFinalize {
+		// If decay occurred, burn the difference
+		if decayedBalance.Cmp(balance) < 0 {
+			decayAmount := new(uint256.Int).Sub(balance, decayedBalance)
+			if !decayAmount.IsZero() {
+				// Burn the decayed amount from the account
+				if err := k.burnDecayedAmount(ctx, addr, decayAmount); err != nil {
+					// Log the error but continue with the original balance
+					k.Logger(ctx).Error(
+						"failed to burn decayed balance",
+						"address", addr.Hex(),
+						"decay_amount", decayAmount.String(),
+						"error", err.Error(),
+					)
+					acct.Balance = balance
+					return acct
+				}
+			}
+		}
+		// Update the decay timestamp
+		k.SetDecayTimestamp(ctx, addr, currentTime)
+	}
+
+	acct.Balance = decayedBalance
 	return acct
+}
+
+// burnDecayedAmount burns the decayed amount from an account's balance.
+func (k *Keeper) burnDecayedAmount(ctx sdk.Context, addr common.Address, amount *uint256.Int) error {
+	cosmosAddr := sdk.AccAddress(addr.Bytes())
+	return k.bankWrapper.BurnAmountFromAccount(ctx, cosmosAddr, amount.ToBig())
+}
+
+// GetDecayedBalance returns the balance with decay applied for the given address.
+// This is a read-only calculation that does NOT modify state (no burning, no timestamp update).
+// Use this for queries like eth_getBalance.
+func (k *Keeper) GetDecayedBalance(ctx sdk.Context, addr common.Address) *uint256.Int {
+	balance := k.SpendableCoin(ctx, addr)
+	if balance == nil || balance.IsZero() {
+		return balance
+	}
+
+	// Get decay timestamp to calculate elapsed time
+	currentTime := uint64(ctx.BlockTime().Unix()) //nolint:gosec // G115 // won't exceed uint64
+	lastDecayTime := k.GetDecayTimestamp(ctx, addr)
+
+	// If no decay timestamp set yet, return current balance (no decay reference point)
+	if lastDecayTime == 0 {
+		return balance
+	}
+
+	if currentTime <= lastDecayTime {
+		// No time elapsed or clock skew, no decay
+		return balance
+	}
+
+	// Calculate elapsed seconds and compute decayed balance
+	elapsedSeconds := currentTime - lastDecayTime
+	return types.ApplyDecay(balance, elapsedSeconds)
 }
 
 // GetState loads contract state from database.
@@ -282,6 +379,9 @@ func (k *Keeper) DeleteAccount(ctx sdk.Context, addr common.Address) error {
 	// clear code hash
 	k.DeleteCodeHash(ctx, addr)
 
+	// clear decay timestamp
+	k.DeleteDecayTimestamp(ctx, addr)
+
 	// remove auth account
 	k.accountKeeper.RemoveAccount(ctx, acct)
 
@@ -292,4 +392,33 @@ func (k *Keeper) DeleteAccount(ctx sdk.Context, addr common.Address) error {
 	)
 
 	return nil
+}
+
+// ----------------------------------------------------------------------------
+// Balance Decay
+// ----------------------------------------------------------------------------
+
+// GetDecayTimestamp returns the last access timestamp for an account.
+// Returns 0 if not set (account never accessed for decay purposes).
+func (k *Keeper) GetDecayTimestamp(ctx sdk.Context, addr common.Address) uint64 {
+	store := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixDecayTimestamp)
+	bz := store.Get(addr.Bytes())
+	if len(bz) == 0 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(bz)
+}
+
+// SetDecayTimestamp sets the last access timestamp for an account.
+func (k *Keeper) SetDecayTimestamp(ctx sdk.Context, addr common.Address, timestamp uint64) {
+	store := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixDecayTimestamp)
+	bz := make([]byte, 8)
+	binary.BigEndian.PutUint64(bz, timestamp)
+	store.Set(addr.Bytes(), bz)
+}
+
+// DeleteDecayTimestamp removes the decay timestamp for an account.
+func (k *Keeper) DeleteDecayTimestamp(ctx sdk.Context, addr common.Address) {
+	store := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefixDecayTimestamp)
+	store.Delete(addr.Bytes())
 }
